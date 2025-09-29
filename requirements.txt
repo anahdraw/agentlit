@@ -5,3 +5,7 @@ python-dateutil==2.9.0.post0
 streamlit
 openai
 PyPDF2
+chromadb
+tiktoken
+python-docx
+sentence-transformers
