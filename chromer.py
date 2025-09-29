@@ -3,6 +3,7 @@ import io
 import uuid
 import time
 import streamlit as st
+from urllib.parse import urlparse
 
 # ---- Optional dependencies for parsing & embeddings ----
 try:
@@ -10,6 +11,7 @@ try:
     from chromadb import HttpClient
     from chromadb.utils import embedding_functions
 except Exception as e:
+    st.error(f"Gagal mengimpor chromadb. Pastikan sudah terpasang. Error: {e}")
     st.stop()
 
 try:
@@ -43,9 +45,14 @@ with st.sidebar:
     st.header("🔐 Koneksi Chroma")
     chroma_mode = st.radio("Mode", ["Chroma Cloud (HTTP)", "Local (Persistent)"], index=0)
     if chroma_mode == "Chroma Cloud (HTTP)":
-        host = st.text_input("Host", value="https://api.trychroma.com")
-        tenant = st.text_input("Tenant (UUID / name)", value="", help="Isi sesuai konfigurasi Chroma Cloud")
-        database = st.text_input("Database", value="", help="Isi sesuai konfigurasi Chroma Cloud")
+        host = st.text_input(
+            "Host",
+            value=os.getenv("CHROMA_HOST", ""),
+            placeholder="https://your-cluster.region.trychroma.com",
+            help="Salin 'Cluster Endpoint' dari dashboard Chroma Cloud Anda."
+        )
+        tenant = st.text_input("Tenant (UUID / name)", value=os.getenv("CHROMA_TENANT", "default_tenant"))
+        database = st.text_input("Database", value=os.getenv("CHROMA_DATABASE", "default_database"))
         chroma_api_key = st.text_input("Chroma API Key", type="password", value=os.getenv("CHROMA_API_KEY", ""))
     else:
         persist_dir = st.text_input("Persist Directory", value="./chroma_data")
@@ -67,18 +74,21 @@ def chunk_text(text, size=900, overlap=150):
         return []
     # Prefer tiktoken-based chunking by token count if available
     if tiktoken is not None:
-        enc = tiktoken.get_encoding("cl100k_base")
-        toks = enc.encode(text)
-        chunks = []
-        i = 0
-        # approx chars per token ~ 4
-        tok_size = max(50, size // 4)
-        tok_overlap = max(0, overlap // 4)
-        while i < len(toks):
-            chunk = enc.decode(toks[i:i+tok_size])
-            chunks.append(chunk)
-            i += max(1, tok_size - tok_overlap)
-        return chunks
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            toks = enc.encode(text)
+            chunks = []
+            i = 0
+            # approx chars per token ~ 4
+            tok_size = max(50, size // 4)
+            tok_overlap = max(0, overlap // 4)
+            while i < len(toks):
+                chunk = enc.decode(toks[i:i+tok_size])
+                chunks.append(chunk)
+                i += max(1, tok_size - tok_overlap)
+            return chunks
+        except Exception: # Fallback if encoding fails
+            pass
     # Fallback by characters
     chunks = []
     i = 0
@@ -114,14 +124,36 @@ def get_chroma_client():
             st.error("Lengkapi Host, Tenant, Database, dan Chroma API Key.")
             st.stop()
         try:
-            client = HttpClient(host=host, tenant=tenant, database=database, api_key=chroma_api_key)
-            # quick ping by listing collections
-            _ = client.list_collections()
+            # FIX: The API key must be passed in the headers.
+            headers = {"Authorization": f"Bearer {chroma_api_key}"}
+
+            # FIX: HttpClient expects host without protocol; port and ssl are separate.
+            parsed_uri = urlparse(host)
+            cleaned_host = parsed_uri.hostname
+            port = parsed_uri.port
+            ssl = parsed_uri.scheme == 'https'
+
+            if not port:
+                port = 443 if ssl else 80
+
+            if not cleaned_host:
+                 st.error("Format Host tidak valid. Harusnya seperti 'https://your-cluster.region.trychroma.com'")
+                 st.stop()
+
+            client = HttpClient(
+                host=cleaned_host,
+                port=port,
+                ssl=ssl,
+                headers=headers,
+                tenant=tenant,
+                database=database
+            )
+            _ = client.list_collections() # Quick ping to check connection
             return client
         except Exception as e:
             st.error(f"Gagal konek ke Chroma Cloud: {e}")
             st.stop()
-    else:
+    else: # Local Persistent
         try:
             client = chromadb.PersistentClient(path=persist_dir)
             _ = client.list_collections()
@@ -140,43 +172,37 @@ def get_embedding_function():
             api_key=openai_api_key,
             model_name="text-embedding-3-small"
         )
-    else:
-        # Lazy import; will require sentence-transformers in requirements
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-        return SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    else: # Sentence-Transformers
+        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 
 def get_or_create_collection():
     client = get_chroma_client()
-    emb = get_embedding_function()
-    try:
-        col = client.get_or_create_collection(name=collection_name, embedding_function=emb, metadata={"hnsw:space": "cosine"})
-    except TypeError:
-        # For some versions, embedding_function must be passed on creation only
-        try:
-            col = client.get_collection(name=collection_name)
-        except Exception:
-            col = client.create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
-    return col
+    emb_func = get_embedding_function()
+    # The embedding_function is passed on creation and not needed for get.
+    # This logic correctly handles getting an existing collection.
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=emb_func,
+        metadata={"hnsw:space": "cosine"}
+    )
+    return collection
 
 def list_sources(col, limit=1000, offset=0):
-    # Fetch metadatas in batches; aggregate unique 'source'
-    # WARNING: For huge collections this is naive; adapt as needed.
     try:
         res = col.get(include=["metadatas"], limit=limit, offset=offset)
         metas = res.get("metadatas", []) or []
         sources = [m.get("source","unknown") for m in metas if isinstance(m, dict)]
-        return sources, res.get("ids", []), len(metas)
+        return sources, len(metas)
     except Exception as e:
         st.warning(f"Gagal mengambil daftar dokumen: {e}")
-        return [], [], 0
+        return [], 0
 
 def build_prompt(question, results):
-    # results: (docs, metadatas)
     numbered = []
     for i, (doc, meta) in enumerate(results, start=1):
         src = meta.get("source", "unknown")
         chunk_idx = meta.get("chunk", "?")
-        numbered.append(f"[{i}] Source: {src} (chunk {chunk_idx}) — {doc[:300].strip()}")
+        numbered.append(f"[{i}] Source: {src} (chunk {chunk_idx}) — {doc.strip()}")
     context = "\n\n".join(numbered)
     system = "Anda adalah asisten yang menjawab hanya dari konteks berikut. Berikan jawaban ringkas dan tambahkan sitasi [n] pada klaim penting."
     user = f"Pertanyaan: {question}\n\nKonteks:\n{context}\n\nInstruksi: Jawab ringkas, lalu daftar sumber yang dirujuk."
@@ -190,15 +216,19 @@ def openai_answer(system_msg, user_msg):
         st.error("OPENAI_API_KEY kosong.")
         st.stop()
     client = OpenAI(api_key=openai_api_key)
-    resp = client.chat.completions.create(
-        model=openai_model,
-        messages=[
-            {"role":"system","content":system_msg},
-            {"role":"user","content":user_msg},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = client.chat.completions.create(
+            model=openai_model,
+            messages=[
+                {"role":"system","content":system_msg},
+                {"role":"user","content":user_msg},
+            ],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Gagal memanggil OpenAI API: {e}")
+        return None
 
 # ---------------- Tabs ----------------
 tab_up, tab_list, tab_chat = st.tabs(["⬆️ Upload to Chroma", "📄 List Dokumen", "💬 Chat RAG"])
@@ -207,52 +237,58 @@ with tab_up:
     st.subheader("Upload Dokumen")
     uploader = st.file_uploader("Pilih file (.pdf, .docx, .txt)", accept_multiple_files=True, type=["pdf","docx","txt","md"])
     if uploader and st.button("🚀 Upload ke Chroma"):
-        col = get_or_create_collection()
+        collection = get_or_create_collection()
         with st.spinner("Memproses & mengunggah..."):
             total_chunks = 0
             for f in uploader:
-                text = read_file(f)
-                chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
-                ids = [f"{f.name}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(chunks))]
-                metadatas = [{"source": f.name, "chunk": i, "uploaded_at": int(time.time())} for i in range(len(chunks))]
                 try:
-                    col.add(documents=chunks, ids=ids, metadatas=metadatas)
+                    text = read_file(f)
+                    chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
+                    if not chunks:
+                        st.warning(f"File {f.name} tidak menghasilkan chunk apapun.")
+                        continue
+                    ids = [f"{f.name}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(chunks))]
+                    metadatas = [{"source": f.name, "chunk": i, "uploaded_at": int(time.time())} for i in range(len(chunks))]
+                    collection.add(documents=chunks, ids=ids, metadatas=metadatas)
                     total_chunks += len(chunks)
                 except Exception as e:
                     st.error(f"Gagal upload {f.name}: {e}")
-            st.success(f"Selesai. Total chunks diunggah: {total_chunks}")
+            if total_chunks > 0:
+                st.success(f"Selesai. Total chunks diunggah: {total_chunks}")
 
 with tab_list:
     st.subheader("Daftar Dokumen (berdasarkan metadata 'source')")
-    col = get_or_create_collection()
-    unique_sources = set()
-    offset = 0
-    batch = 1000
-    total = 0
-    with st.spinner("Mengambil daftar..."):
-        while True:
-            sources, ids, got = list_sources(col, limit=batch, offset=offset)
-            if got == 0:
-                break
-            unique_sources.update(sources)
-            total += got
-            offset += got
-            if got < batch:  # last page
-                break
-    st.write(f"Total entries dibaca: {total}")
-    st.write(f"Dokumen unik: {len(unique_sources)}")
-    st.dataframe(sorted(unique_sources))
+    if st.button("🔄 Refresh Daftar Dokumen"):
+        collection = get_or_create_collection()
+        unique_sources = set()
+        offset = 0
+        batch = 1000
+        total_docs = 0
+        with st.spinner("Mengambil daftar..."):
+            while True:
+                sources, got = list_sources(collection, limit=batch, offset=offset)
+                if got == 0:
+                    break
+                unique_sources.update(sources)
+                total_docs += got
+                offset += got
+                if got < batch:
+                    break
+        st.write(f"Total entri dalam koleksi: {total_docs}")
+        st.write(f"Dokumen unik (berdasarkan nama file): {len(unique_sources)}")
+        if unique_sources:
+            st.dataframe(sorted(list(unique_sources)), use_container_width=True)
+        else:
+            st.info("Belum ada dokumen yang diunggah ke koleksi ini.")
+
 
 with tab_chat:
     st.subheader("Chat ke Dokumen")
     question = st.text_input("Pertanyaan")
     if st.button("Tanya") and question.strip():
-        col = get_or_create_collection()
+        collection = get_or_create_collection()
         with st.spinner("Mengambil konteks dari Chroma..."):
-            try:
-                qres = col.query(query_texts=[question], n_results=top_k, include=["documents","metadatas","distances"])
-            except TypeError:
-                qres = col.query(query_texts=[question], n_results=top_k, include=["documents","metadatas"])
+            qres = collection.query(query_texts=[question], n_results=top_k, include=["documents","metadatas"])
 
         docs = (qres.get("documents") or [[]])[0]
         metas = (qres.get("metadatas") or [[]])[0]
@@ -265,11 +301,12 @@ with tab_chat:
             with st.spinner("Menyusun jawaban..."):
                 answer = openai_answer(system_msg, user_msg)
 
-            st.markdown("### 🧾 Jawaban")
-            st.write(answer)
+            if answer:
+                st.markdown("### 🧾 Jawaban")
+                st.write(answer)
 
-            st.markdown("### 📚 Sumber")
-            for i, (_, m) in enumerate(pairs, start=1):
-                src = m.get("source","unknown")
-                ch = m.get("chunk","?")
-                st.write(f"[{i}] {src} (chunk {ch})")
+                st.markdown("### 📚 Sumber")
+                for i, (_, m) in enumerate(pairs, start=1):
+                    src = m.get("source","unknown")
+                    ch = m.get("chunk","?")
+                    st.write(f"[{i}] {src} (chunk {ch})")
